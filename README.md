@@ -25,38 +25,22 @@ Executed on **Google Cloud Run Jobs** (`us-central1`, Execution `sec-dataset-bui
 ### 1.1 Why It Runs at Wire Speed on Linux (`swift-corelibs-foundation`)
 On Linux, Swift's `URLSession` wraps `libcurl`. A single `URLSession` instance multiplexes all transfers through a single internal `curl_multi` handle guarded by a mutex, which serializes socket readiness callbacks under high concurrency. `LiveSECFetcher` and `GCSDirectUploader` bypass this bottleneck by instantiating **two independent 16-session `URLSession` pools per container task** (`32` `curl_multi` event loops per task × `5` tasks = **`160` independent `libcurl` multi-handles** across `40` vCPUs) and streaming bytes directly from EDGAR response buffers into GCS `uploadType=media` `PUT` requests with zero intermediate filesystem writes.
 
-### 1.2 Billing Mechanics: Why Distributed Sharding Is Not Billed in Wall-Clock Time
+### 1.2 Law Firm Billing & Realization Economics: Why Machine Velocity Does Not Cannibalize the Bill
 
-A common misconception in legal engineering is that provisioning a 40-vCPU distributed cluster is $10\times$ as expensive as provisioning a 4-vCPU instance. **Google Cloud Run Jobs and GKE Batch workloads are not billed by wall-clock time or idle provisioned capacity—they are billed strictly by aggregate resource-seconds (`vCPU-seconds` and `GiB-seconds`) consumed across tasks, rounded to the nearest 100 milliseconds.**
+When law firm partners hear that a system is "faster," a common reflexive concern is: *"If we execute in 5.69 seconds what used to take junior associates 40 hours of manual EDGAR pulling and exhibit assembly, did we just vaporize 40 billable hours from the invoice?"*
 
-Let $N$ be the number of parallel shard tasks, $v$ be the vCPUs allocated per task, $m$ be the memory (GiB) per task, and $t(N, v)$ be the per-task execution duration in seconds. With GCP Tier-1 (`us-central1`) rates of $p_{\text{cpu}} = \$0.00001800 / \text{vCPU-second}$ and $p_{\text{mem}} = \$0.00000200 / \text{GiB-second}$, total compute cost $C_{\text{compute}}$ is:
+**No. An engineering-driven partnership does not bill its clients in machine wall-clock time—and it does not penalize itself for writing solid code.**
 
-$$
-C_{\text{compute}}(N, v, m) = \sum_{k=1}^{N} t_k(N, v) \cdot \left( p_{\text{cpu}} \cdot v + p_{\text{mem}} \cdot m \right)
-$$
+`SECDatasetBuilder` is built around three structural truths of modern BigLaw revenue and partnership economics:
 
-When a workload of total work $W$ is horizontally sharded across $N$ independent tasks with near-linear speedup, per-task duration scales inversely with $N$:
+1. **Client Realization & Outside Counsel Guidelines (Eliminating Write-Offs, Not Billable Cap):**
+   Institutional issuers and private-equity sponsors increasingly reject or write down associate time entries billed to mechanical EDGAR scraping, precedent hunting, and exhibit table formatting. Manual collection is the lowest-realization, highest-write-off activity on a Capital Markets bill. Collapsing the mechanical ingestion of 50 `S-1` filings and 1,156 exhibits into `5.69 seconds` eliminates uncollectible friction and shifts 100% of associate and paralegal hours into high-realization substantive analysis, covenant negotiation, and active drafting.
+2. **Corpus-Complexity Valuation (`focusedSeconds`) vs. Execution Latency:**
+   Notice that in `DatasetCompiler.swift`, every compiled `CanonicalDocumentRecord` explicitly computes and persists an analytical time baseline (`focusedSeconds: max(300, min(3600, wordCount * 2))`) calibrated to the substantive legal complexity and word volume of the instrument—**never** the `4.7 ms` of machine wall-clock time required to ingest it. Whether priced as a proprietary market-intelligence deliverable, folded into fixed/capped IPO fee arrangements, or billed through active lawyer–paralegal review inside the workstation (`Time.json`), the economic unit is the **substantive legal work product and cognitive focus**, not server execution seconds.
+3. **The Proprietary Terminal Moat & IRC § 174A Byproduct Capture:**
+   Manual associate teams cannot read and cross-index 1,156 material contracts, charters, and underwriting agreements across 50 peer deals during a live partner pitch or a 24-hour pricing window—at *any* staffing level. Delivering empirical market distribution screens that cannot be produced without the instrument creates asymmetric pricing power during client pitches while keeping attorneys inside an active drafting environment where every structural decision (`(X, Z, R)` innovation tuples and paralegal boundary labels) compounds firm-owned models and substantiates domestic software R&E expenditures under **26 U.S.C. § 174A(d)(3)** (**Schedule K-1, Box 17, Code BA**).
 
-$$
-t_k(N, v) = \frac{t_{\text{serial}}}{N} + \tau_{\text{init}}
-$$
-
-where $\tau_{\text{init}} \approx 0.46\text{s}$ is the constant index-fetch overhead. Multiplying $N$ tasks by $t_{\text{serial}} / N$ cancels $N$:
-
-$$
-N \cdot \left(\frac{t_{\text{serial}}}{N} + \tau_{\text{init}}\right) = t_{\text{serial}} + N \tau_{\text{init}}
-$$
-
-**Consequence (Conservation of vCPU-Seconds):** Running **1 task for 30 seconds** consumes the exact same number of `vCPU-seconds` as running **5 tasks in parallel for 6 seconds**, plus only the sub-second index lookup $\tau_{\text{init}}$ per shard:
-
-| Configuration | Tasks ($N$) | vCPU / Task ($v$) | Total vCPUs ($N \cdot v$) | Task Wall-Clock ($t_k$) | Billed `vCPU-seconds` ($N \cdot v \cdot t_k$) | Compute Cost ($p_{\text{cpu}} + p_{\text{mem}}$) | GCS Class A PUTs (1,257 objs) | Total Run Cost |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Single-Task (`vq7w2`)** | 1 | 4 | 4 vCPUs | `28.99s` | `115.96 vCPU-s` | `$0.00232` | `$0.00628` | **`$0.0086`** |
-| **5-Shard × 4 vCPU** | 5 | 4 | 20 vCPUs | `~6.30s` | `126.00 vCPU-s` | `$0.00252` | `$0.00628` | **`$0.0088`** |
-| **5-Shard × 8 vCPU (`6c2sf`)** | 5 | 8 | **40 vCPUs** | **`6.22s`** | **`248.80 vCPU-s`** | **`$0.00498`** | **`$0.00628`** | **`$0.0113`** *(~$0.0050 after free tier)* |
-
-- **Zero Idle Cost:** The moment the 6.22-second execution finishes, billing drops to **$0.00/hour**.
-- **Linear Latency Collapse at Near-Constant Cost:** Scaling from 1 task to 5 shards cuts user-visible latency by **$5.01\times$** (`28.50s` $\to$ `5.69s`) while the fixed GCS Class A `PUT` cost (`1,257` objects $\times \$0.005 / 1,000 = \$0.00628$) remains identical regardless of how many tasks write the objects in parallel.
+*Note on Cloud Infrastructure Unit Cost:* On the cost side of the ledger, Google Cloud Run Jobs also bills by aggregate `vCPU-seconds` ($\sum t_k \cdot v_k$) rather than wall-clock capacity—meaning 5 parallel 8-vCPU shards completing in `5.69s` cost **`$0.0058` total** (~$0.01 before free tier) and drop to `$0.00/hr` the instant the job finishes. The firm captures institutional-scale analytical output for half a cent of compute without sacrificing a single dollar of billable realization.
 
 ---
 

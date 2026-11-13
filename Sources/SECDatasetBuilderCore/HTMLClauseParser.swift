@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(FoundationXML)
+import FoundationXML
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#endif
 
 public enum HTMLClauseParser {
     /// 16 pre-trained logistic regression weights matching AppJavaadica's `LearnedClauseSegmenter`.
@@ -18,54 +23,113 @@ public enum HTMLClauseParser {
 
     public static func extractItem16Attachments(from html: String, relativeTo filingURL: URL?) -> [SECAttachment] {
         let cleaned = stripSECHeaderAndHiddenIX(html)
-        guard let doc = try? XMLDocument(xmlString: cleaned, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]) else {
+        #if !os(Linux)
+        if cleaned.utf8.count <= 250_000,
+           let doc = try? XMLDocument(xmlString: cleaned, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]) {
+            let baseHref = (try? doc.nodes(forXPath: "(//*[local-name()='base'][@href])[1]/@href"))?.first?.stringValue
+            let baseURL = baseHref.flatMap { href in
+                filingURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
+            } ?? filingURL
+
+            var seenFiles: Set<String> = []
+            var results: [SECAttachment] = []
+
+            if let rows = try? doc.nodes(forXPath: "//*[local-name()='tr']") {
+                for case let row as XMLElement in rows {
+                    guard let links = try? row.nodes(forXPath: ".//*[local-name()='a'][@href]"),
+                          let firstLink = links.first as? XMLElement,
+                          let href = firstLink.attribute(forName: "href")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !href.isEmpty,
+                          !href.hasPrefix("#") else {
+                        continue
+                    }
+
+                    let resolvedURL: URL? = baseURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
+                    guard let url = canonicalURL(resolvedURL) else { continue }
+                    let fileKey = url.lastPathComponent.lowercased()
+                    guard fileKey.hasSuffix(".htm") || fileKey.hasSuffix(".html") else { continue }
+                    if let mainFile = filingURL?.lastPathComponent.lowercased(), fileKey == mainFile { continue }
+                    if fileKey.contains("ex-fee") || fileKey.contains("exfee") { continue }
+
+                    let cells = (try? row.nodes(forXPath: "./*[local-name()='td' or local-name()='th']")) ?? []
+                    let cellTexts = cells.map { normalizeWhitespace($0.stringValue ?? "") }.filter { !$0.isEmpty }
+                    let firstCell = cellTexts.first ?? ""
+                    let exhibitNo = sanitizeExhibitNo(firstCell)
+                    let linkText = normalizeWhitespace(firstLink.stringValue ?? "")
+                    let combinedDesc = linkText.isEmpty ? (cellTexts.last ?? fileKey) : linkText
+
+                    if combinedDesc.lowercased().contains("included in exhibit") { continue }
+                    guard seenFiles.insert(fileKey).inserted else { continue }
+
+                    let displayName = !exhibitNo.isEmpty ? "Ex. \(exhibitNo) — \(combinedDesc)" : combinedDesc
+                    results.append(SECAttachment(exhibitNo: exhibitNo, docName: displayName, docURL: url.absoluteString))
+                }
+            }
+            if !results.isEmpty {
+                return results
+            }
+        }
+        #endif
+        return extractItem16AttachmentsFastRegex(from: cleaned, relativeTo: filingURL)
+    }
+
+    private static func extractItem16AttachmentsFastRegex(from cleaned: String, relativeTo filingURL: URL?) -> [SECAttachment] {
+        guard let trRegex = try? NSRegularExpression(pattern: #"<tr\b[^>]*>(.*?)</tr>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]),
+              let aRegex = try? NSRegularExpression(pattern: #"<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]),
+              let tdRegex = try? NSRegularExpression(pattern: #"<t[dh]\b[^>]*>(.*?)</t[dh]>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
             return []
         }
 
-        let baseHref = (try? doc.nodes(forXPath: "(//*[local-name()='base'][@href])[1]/@href"))?.first?.stringValue
-        let baseURL = baseHref.flatMap { href in
-            filingURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
-        } ?? filingURL
-
+        let ns = cleaned as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
         var seenFiles: Set<String> = []
         var results: [SECAttachment] = []
 
-        if let rows = try? doc.nodes(forXPath: "//*[local-name()='tr']") {
-            for case let row as XMLElement in rows {
-                guard let links = try? row.nodes(forXPath: ".//*[local-name()='a'][@href]"),
-                      let firstLink = links.first as? XMLElement,
-                      let href = firstLink.attribute(forName: "href")?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !href.isEmpty,
-                      !href.hasPrefix("#") else {
-                    continue
-                }
+        trRegex.enumerateMatches(in: cleaned, options: [], range: fullRange) { match, _, _ in
+            guard let match else { return }
+            let rowStr = ns.substring(with: match.range(at: 1))
+            guard rowStr.range(of: "href", options: .caseInsensitive) != nil else { return }
+            let rowNS = rowStr as NSString
+            let rowRange = NSRange(location: 0, length: rowNS.length)
+            guard let linkMatch = aRegex.firstMatch(in: rowStr, options: [], range: rowRange) else { return }
 
-                let resolvedURL: URL? = baseURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
-                guard let url = canonicalURL(resolvedURL) else { continue }
-                let fileKey = url.lastPathComponent.lowercased()
-                guard fileKey.hasSuffix(".htm") || fileKey.hasSuffix(".html") else { continue }
-                if let mainFile = filingURL?.lastPathComponent.lowercased(), fileKey == mainFile { continue }
-                if fileKey.contains("ex-fee") || fileKey.contains("exfee") { continue }
+            let href = rowNS.substring(with: linkMatch.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !href.isEmpty, !href.hasPrefix("#") else { return }
 
-                let cells = (try? row.nodes(forXPath: "./*[local-name()='td' or local-name()='th']")) ?? []
-                let cellTexts = cells.map { normalizeWhitespace($0.stringValue ?? "") }.filter { !$0.isEmpty }
-                let firstCell = cellTexts.first ?? ""
-                let exhibitNo = sanitizeExhibitNo(firstCell)
-                let linkText = normalizeWhitespace(firstLink.stringValue ?? "")
-                let combinedDesc = linkText.isEmpty ? (cellTexts.last ?? fileKey) : linkText
+            let resolvedURL: URL? = filingURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
+            guard let url = canonicalURL(resolvedURL) else { return }
+            let fileKey = url.lastPathComponent.lowercased()
+            guard fileKey.hasSuffix(".htm") || fileKey.hasSuffix(".html") else { return }
+            if let mainFile = filingURL?.lastPathComponent.lowercased(), fileKey == mainFile { return }
+            if fileKey.contains("ex-fee") || fileKey.contains("exfee") { return }
 
-                // Skip secondary cross-references like "23.2 | Consent of Counsel (included in Exhibit 5.1)"
-                if combinedDesc.lowercased().contains("included in exhibit") { continue }
-                guard seenFiles.insert(fileKey).inserted else { continue }
+            let tdMatches = tdRegex.matches(in: rowStr, options: [], range: rowRange)
+            let cellTexts = tdMatches.map { normalizeWhitespace(stripTags(rowNS.substring(with: $0.range(at: 1)))) }.filter { !$0.isEmpty }
+            let firstCell = cellTexts.first ?? ""
+            let exhibitNo = sanitizeExhibitNo(firstCell)
+            let linkText = normalizeWhitespace(stripTags(rowNS.substring(with: linkMatch.range(at: 2))))
+            let combinedDesc = linkText.isEmpty ? (cellTexts.last ?? fileKey) : linkText
 
-                let displayName: String
-                if !exhibitNo.isEmpty {
-                    displayName = "Ex. \(exhibitNo) — \(combinedDesc)"
-                } else {
-                    displayName = combinedDesc
-                }
-                results.append(SECAttachment(exhibitNo: exhibitNo, docName: displayName, docURL: url.absoluteString))
-            }
+            if combinedDesc.lowercased().contains("included in exhibit") { return }
+            guard seenFiles.insert(fileKey).inserted else { return }
+
+            let displayName = !exhibitNo.isEmpty ? "Ex. \(exhibitNo) — \(combinedDesc)" : combinedDesc
+            results.append(SECAttachment(exhibitNo: exhibitNo, docName: displayName, docURL: url.absoluteString))
+        }
+
+        aRegex.enumerateMatches(in: cleaned, options: [], range: fullRange) { linkMatch, _, _ in
+            guard let linkMatch else { return }
+            let href = ns.substring(with: linkMatch.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !href.isEmpty, !href.hasPrefix("#") else { return }
+            let resolvedURL: URL? = filingURL.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
+            guard let url = canonicalURL(resolvedURL) else { return }
+            let fileKey = url.lastPathComponent.lowercased()
+            if let mainFile = filingURL?.lastPathComponent.lowercased(), fileKey == mainFile { return }
+            if fileKey.contains("ex-fee") || fileKey.contains("exfee") { return }
+            let linkText = normalizeWhitespace(stripTags(ns.substring(with: linkMatch.range(at: 2))))
+            if linkText.lowercased().contains("included in exhibit") { return }
+            guard seenFiles.insert(fileKey).inserted else { return }
+            results.append(SECAttachment(exhibitNo: "", docName: linkText.isEmpty ? url.lastPathComponent : linkText, docURL: url.absoluteString))
         }
         return results
     }
@@ -429,8 +493,62 @@ public enum HTMLClauseParser {
     }
 
     public static func sha256Hex(_ text: String) -> String {
+        #if canImport(CryptoKit)
         let digest = SHA256.hash(data: Data(text.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+        #else
+        return pureSwiftSHA256Hex(Array(text.utf8))
+        #endif
+    }
+
+    private static func pureSwiftSHA256Hex(_ bytes: [UInt8]) -> String {
+        let k: [UInt32] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+        ]
+        var h: [UInt32] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        ]
+        var msg = bytes
+        let bitLen = UInt64(bytes.count) * 8
+        msg.append(0x80)
+        while (msg.count % 64) != 56 { msg.append(0x00) }
+        for shift in stride(from: 56, through: 0, by: -8) {
+            msg.append(UInt8((bitLen >> UInt64(shift)) & 0xff))
+        }
+        func ror(_ x: UInt32, _ n: UInt32) -> UInt32 { (x >> n) | (x << (32 - n)) }
+        var w = [UInt32](repeating: 0, count: 64)
+        for chunkStart in stride(from: 0, to: msg.count, by: 64) {
+            for i in 0..<16 {
+                let j = chunkStart + i * 4
+                w[i] = (UInt32(msg[j]) << 24) | (UInt32(msg[j+1]) << 16) | (UInt32(msg[j+2]) << 8) | UInt32(msg[j+3])
+            }
+            for i in 16..<64 {
+                let s0 = ror(w[i-15], 7) ^ ror(w[i-15], 18) ^ (w[i-15] >> 3)
+                let s1 = ror(w[i-2], 17) ^ ror(w[i-2], 19) ^ (w[i-2] >> 10)
+                w[i] = w[i-16] &+ s0 &+ w[i-7] &+ s1
+            }
+            var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7]
+            for i in 0..<64 {
+                let S1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)
+                let ch = (e & f) ^ ((~e) & g)
+                let temp1 = hh &+ S1 &+ ch &+ k[i] &+ w[i]
+                let S0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)
+                let maj = (a & b) ^ (a & c) ^ (b & c)
+                let temp2 = S0 &+ maj
+                hh = g; g = f; f = e; e = d &+ temp1; d = c; c = b; b = a; a = temp1 &+ temp2
+            }
+            h[0] = h[0] &+ a; h[1] = h[1] &+ b; h[2] = h[2] &+ c; h[3] = h[3] &+ d
+            h[4] = h[4] &+ e; h[5] = h[5] &+ f; h[6] = h[6] &+ g; h[7] = h[7] &+ hh
+        }
+        return h.map { String(format: "%08x", $0) }.joined()
     }
 
     public static func makeSlug(_ input: String) -> String {
@@ -508,12 +626,53 @@ public enum HTMLClauseParser {
     }
 
     private static func canonicalURL(_ url: URL?) -> URL? {
-        guard var components = url.flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }) else {
+        guard let url,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host?.lowercased(),
+              ["www.sec.gov", "sec.gov", "edgar-mirror.sec-api.io"].contains(host),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return nil
         }
-        components.fragment = nil
+
+        // Resolve dot segments before checking the archive prefix. Viewer links point to
+        // the actual document via ?doc=; never download the /ix viewer itself.
+        var path = normalizedPath(components.path)
+        if ["/ix", "/ixviewer/doc/action", "/ixviewer/ix.html"].contains(path) {
+            guard let document = components.queryItems?.first(where: { $0.name == "doc" })?.value,
+                  document.hasPrefix("/Archives/edgar/data/") else { return nil }
+            path = normalizedPath(document)
+        }
+        if host == "edgar-mirror.sec-api.io", !path.hasPrefix("/Archives/edgar/data/") {
+            path = "/Archives/edgar/data" + path
+        }
+        guard path.hasPrefix("/Archives/edgar/data/") else { return nil }
+        let parts = path.dropFirst("/Archives/edgar/data/".count).split(separator: "/")
+        guard parts.count == 3,
+              parts[0].allSatisfy({ $0.isASCII && $0.isNumber }),
+              parts[1].allSatisfy({ $0.isASCII && ($0.isNumber || $0 == "-") }),
+              parts[2].contains(".") else { return nil }
+
+        components.path = path
+        components.scheme = "https"
+        components.host = "www.sec.gov"
+        components.port = nil
+        components.user = nil
+        components.password = nil
         components.query = nil
+        components.fragment = nil
         return components.url
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        var segments: [Substring] = []
+        for segment in path.split(separator: "/") {
+            if segment == ".." {
+                if !segments.isEmpty { segments.removeLast() }
+            } else if segment != "." {
+                segments.append(segment)
+            }
+        }
+        return "/" + segments.joined(separator: "/")
     }
 
     private static func stripTags(_ html: String) -> String {

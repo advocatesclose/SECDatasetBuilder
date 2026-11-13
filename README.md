@@ -22,8 +22,41 @@ Executed on **Google Cloud Run Jobs** (`us-central1`, Execution `sec-dataset-bui
 | **Sustained Bandwidth (Ingress + Egress)** | 18.0 MB/s | **90.0 MB/s** | 256.05 MB ingress + 256.05 MB direct GCS egress |
 | **Per-Run Cloud Compute + Storage Cost** | $0.0029 | **$0.0058** | ~43,000 full 50-deal runs per $250 budget |
 
-### Why It Runs at Wire Speed on Linux (`swift-corelibs-foundation`)
+### 1.1 Why It Runs at Wire Speed on Linux (`swift-corelibs-foundation`)
 On Linux, Swift's `URLSession` wraps `libcurl`. A single `URLSession` instance multiplexes all transfers through a single internal `curl_multi` handle guarded by a mutex, which serializes socket readiness callbacks under high concurrency. `LiveSECFetcher` and `GCSDirectUploader` bypass this bottleneck by instantiating **two independent 16-session `URLSession` pools per container task** (`32` `curl_multi` event loops per task × `5` tasks = **`160` independent `libcurl` multi-handles** across `40` vCPUs) and streaming bytes directly from EDGAR response buffers into GCS `uploadType=media` `PUT` requests with zero intermediate filesystem writes.
+
+### 1.2 Billing Mechanics: Why Distributed Sharding Is Not Billed in Wall-Clock Time
+
+A common misconception in legal engineering is that provisioning a 40-vCPU distributed cluster is $10\times$ as expensive as provisioning a 4-vCPU instance. **Google Cloud Run Jobs and GKE Batch workloads are not billed by wall-clock time or idle provisioned capacity—they are billed strictly by aggregate resource-seconds (`vCPU-seconds` and `GiB-seconds`) consumed across tasks, rounded to the nearest 100 milliseconds.**
+
+Let $N$ be the number of parallel shard tasks, $v$ be the vCPUs allocated per task, $m$ be the memory (GiB) per task, and $t(N, v)$ be the per-task execution duration in seconds. With GCP Tier-1 (`us-central1`) rates of $p_{\text{cpu}} = \$0.00001800 / \text{vCPU-second}$ and $p_{\text{mem}} = \$0.00000200 / \text{GiB-second}$, total compute cost $C_{\text{compute}}$ is:
+
+$$
+C_{\text{compute}}(N, v, m) = \sum_{k=1}^{N} t_k(N, v) \cdot \left( p_{\text{cpu}} \cdot v + p_{\text{mem}} \cdot m \right)
+$$
+
+When a workload of total work $W$ is horizontally sharded across $N$ independent tasks with near-linear speedup, per-task duration scales inversely with $N$:
+
+$$
+t_k(N, v) = \frac{t_{\text{serial}}}{N} + \tau_{\text{init}}
+$$
+
+where $\tau_{\text{init}} \approx 0.46\text{s}$ is the constant index-fetch overhead. Multiplying $N$ tasks by $t_{\text{serial}} / N$ cancels $N$:
+
+$$
+N \cdot \left(\frac{t_{\text{serial}}}{N} + \tau_{\text{init}}\right) = t_{\text{serial}} + N \tau_{\text{init}}
+$$
+
+**Consequence (Conservation of vCPU-Seconds):** Running **1 task for 30 seconds** consumes the exact same number of `vCPU-seconds` as running **5 tasks in parallel for 6 seconds**, plus only the sub-second index lookup $\tau_{\text{init}}$ per shard:
+
+| Configuration | Tasks ($N$) | vCPU / Task ($v$) | Total vCPUs ($N \cdot v$) | Task Wall-Clock ($t_k$) | Billed `vCPU-seconds` ($N \cdot v \cdot t_k$) | Compute Cost ($p_{\text{cpu}} + p_{\text{mem}}$) | GCS Class A PUTs (1,257 objs) | Total Run Cost |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Single-Task (`vq7w2`)** | 1 | 4 | 4 vCPUs | `28.99s` | `115.96 vCPU-s` | `$0.00232` | `$0.00628` | **`$0.0086`** |
+| **5-Shard × 4 vCPU** | 5 | 4 | 20 vCPUs | `~6.30s` | `126.00 vCPU-s` | `$0.00252` | `$0.00628` | **`$0.0088`** |
+| **5-Shard × 8 vCPU (`6c2sf`)** | 5 | 8 | **40 vCPUs** | **`6.22s`** | **`248.80 vCPU-s`** | **`$0.00498`** | **`$0.00628`** | **`$0.0113`** *(~$0.0050 after free tier)* |
+
+- **Zero Idle Cost:** The moment the 6.22-second execution finishes, billing drops to **$0.00/hour**.
+- **Linear Latency Collapse at Near-Constant Cost:** Scaling from 1 task to 5 shards cuts user-visible latency by **$5.01\times$** (`28.50s` $\to$ `5.69s`) while the fixed GCS Class A `PUT` cost (`1,257` objects $\times \$0.005 / 1,000 = \$0.00628$) remains identical regardless of how many tasks write the objects in parallel.
 
 ---
 

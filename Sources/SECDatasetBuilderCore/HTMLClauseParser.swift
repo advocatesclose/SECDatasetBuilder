@@ -625,6 +625,10 @@ public enum HTMLClauseParser {
         return Double(caps) / Double(words.count)
     }
 
+    public static func canonicalSECEdgarURL(from raw: String) -> String? {
+        canonicalURL(URL(string: raw))?.absoluteString
+    }
+
     private static func canonicalURL(_ url: URL?) -> URL? {
         guard let url,
               ["http", "https"].contains(url.scheme?.lowercased() ?? ""),

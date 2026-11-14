@@ -267,6 +267,32 @@ public struct SECFilingMetadata: Codable, Hashable, Sendable {
     public let filedAt: String
     public let documentFormatFiles: [SECDocumentFormatFile]?
 
+    public init(
+        ticker: String? = nil,
+        formType: String,
+        accessionNo: String,
+        cik: String,
+        companyNameLong: String? = nil,
+        companyName: String,
+        linkToFilingDetails: String,
+        description: String? = nil,
+        linkToTxt: String? = nil,
+        filedAt: String,
+        documentFormatFiles: [SECDocumentFormatFile]? = nil
+    ) {
+        self.ticker = ticker
+        self.formType = formType
+        self.accessionNo = accessionNo
+        self.cik = cik
+        self.companyNameLong = companyNameLong
+        self.companyName = companyName
+        self.linkToFilingDetails = linkToFilingDetails
+        self.description = description
+        self.linkToTxt = linkToTxt
+        self.filedAt = filedAt
+        self.documentFormatFiles = documentFormatFiles
+    }
+
     public var filingDateOnly: String {
         String(filedAt.prefix(10))
     }

@@ -300,6 +300,125 @@ public struct LiveSECFetcher: Sendable {
         fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
         return fmt.date(from: raw).map { max(0, $0.timeIntervalSinceNow) }
     }
+
+    // MARK: - Decoupled 4-Screen App Networking (Company Search, Submissions, Item 16 Exhibit Export)
+
+    /// Searches companies by name or ticker via SEC-API `/mapping/name/` and `/mapping/ticker/`.
+    public func searchCompanies(matching rawQuery: String) async throws -> [SECCompanyProfile] {
+        let trimmed = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+        let endpoints: [String] = trimmed.count <= 5 && trimmed.uppercased() == trimmed
+            ? ["https://api.sec-api.io/mapping/ticker/\(encoded)", "https://api.sec-api.io/mapping/name/\(encoded)"]
+            : ["https://api.sec-api.io/mapping/name/\(encoded)", "https://api.sec-api.io/mapping/ticker/\(encoded)"]
+
+        for urlString in endpoints {
+            guard let url = URL(string: urlString) else { continue }
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            req.setValue(apiKey, forHTTPHeaderField: "Authorization")
+            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+            if let data = try? await fetchWithRetry(request: req, sessionIndex: 0),
+               let decoded = try? JSONDecoder().decode([SECCompanyProfile].self, from: data),
+               !decoded.isEmpty {
+                return decoded
+            }
+        }
+        return []
+    }
+
+    /// Fetches all filings (or only Registration Statements / 10-Ks / etc.) for a company CIK.
+    /// Uses SEC-API first and automatically falls back to the SEC's direct `data.sec.gov/submissions/CIK{10-digit}.json`.
+    public func fetchCompanyFilings(
+        cik: String,
+        formFilter: String? = nil,
+        size: Int = 100
+    ) async throws -> [SECFilingMetadata] {
+        let unpadded = cik.replacingOccurrences(of: "^0+", with: "", options: .regularExpression)
+        var lucene = "cik:\"\(unpadded)\""
+        if let formFilter, !formFilter.isEmpty {
+            lucene += " AND (\(formFilter))"
+        }
+
+        if !apiKey.isEmpty,
+           let box = try? await searchFilings(query: lucene, from: 0, size: size),
+           !box.filings.isEmpty {
+            return box.filings
+        }
+
+        // Direct SEC `submissions.json` (`CIK{10-digit-cik}.json`) path
+        return try await fetchFilingsFromSECSubmissionsJSON(cik: cik, formPrefix: formFilter)
+    }
+
+    /// Directly fetches and decodes `https://data.sec.gov/submissions/CIK{10-digit-cik}.json`
+    /// and zips the columnar `filings.recent` parallel arrays (`accessionNumber`, `filingDate`, `form`, `primaryDocument`).
+    public func fetchFilingsFromSECSubmissionsJSON(
+        cik: String,
+        formPrefix: String? = nil
+    ) async throws -> [SECFilingMetadata] {
+        let digits = cik.filter(\.isNumber)
+        let paddedCIK = digits.count >= 10 ? digits : String(repeating: "0", count: 10 - digits.count) + digits
+        guard let url = URL(string: "https://data.sec.gov/submissions/CIK\(paddedCIK).json") else {
+            throw LiveSECFetchError.invalidURL("CIK\(paddedCIK).json")
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let data = try await fetchWithRetry(request: req, sessionIndex: 0)
+        let envelope = try JSONDecoder().decode(SECSubmissionsEnvelope.self, from: data)
+        return envelope.extractFilings(matchingFormPrefix: formPrefix)
+    }
+
+    /// Builds the Screen 3 / Screen 4 Export Package for a selected filing:
+    /// 1. Fetches the primary registration statement / report HTML.
+    /// 2. Parses all Item 16 Exhibits referred to inside the HTML (`HTMLClauseParser.extractItem16Attachments`) — capturing
+    ///    every document referenced in the filing, not merely what sits in `index.json`.
+    /// 3. Optionally fetches `index.json` (`<cik>/<accession>/index.json`) for directory inventory comparison.
+    /// 4. Segments the primary filing into `CanonicalClause` records using the 16-weight logistic classifier.
+    public func buildFilingExportPackage(
+        company: SECCompanyProfile,
+        filing: SECFilingMetadata
+    ) async throws -> SECFilingExportPackage {
+        let canonicalMain = HTMLClauseParser.canonicalSECEdgarURL(from: filing.linkToFilingDetails) ?? filing.linkToFilingDetails
+        let mainData = try await downloadEDGARMirror(documentURL: canonicalMain, sessionIndex: 0)
+        let mainHTML = String(decoding: mainData, as: UTF8.self)
+
+        // 1. Extract all Item 16 Exhibits referenced inside the Registration Statement HTML
+        let baseURL = URL(string: canonicalMain)
+        let referencedExhibits = HTMLClauseParser.extractItem16Attachments(from: mainHTML, relativeTo: baseURL)
+
+        // 2. Also inspect `<cik>/<accession>/index.json` if reachable
+        var directoryFiles: [String] = []
+        if let indexData = try? await downloadEDGARMirror(documentURL: filing.archiveIndexJSONURL.absoluteString, sessionIndex: 1),
+           let archiveDir = try? JSONDecoder().decode(SECArchiveIndexDirectory.self, from: indexData) {
+            directoryFiles = archiveDir.directory.item.map(\.name)
+        }
+
+        // 3. Parse normalized blocks and extract clauses via the 16-feature logistic classifier
+        let parsedBlocks = HTMLClauseParser.parseBlocks(fromHTML: mainHTML, maxBlocks: 240)
+        let clauses = HTMLClauseParser.extractStructuredClauses(
+            fromBlocks: parsedBlocks.blocks,
+            category: filing.formCategoryTitle,
+            docSlug: HTMLClauseParser.makeSlug("\(filing.formType)-\(filing.accessionNo)")
+        )
+
+        return SECFilingExportPackage(
+            company: company,
+            filing: filing,
+            canonicalFilingURL: canonicalMain,
+            archiveIndexJSONURL: filing.archiveIndexJSONURL.absoluteString,
+            archiveHeadersHTMLURL: filing.archiveIndexHeadersHTMLURL.absoluteString,
+            referencedExhibits: referencedExhibits,
+            archiveDirectoryFiles: directoryFiles,
+            extractedClauses: clauses
+        )
+    }
 }
 
 /// Streams downloaded files directly to a Google Cloud Storage bucket over GCP's internal network using a dedicated URLSession pool.
